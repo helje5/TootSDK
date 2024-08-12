@@ -101,36 +101,42 @@ public actor StreamingClient {
     /// Begins a WebSocket connection if there is not already one; otherwise, subscribes to the timeline using the existing connection. If the connection is currently down between retry attempts, will wait until the next successful connection to send the subscribe request, unless ``disconnect()`` is called before then.
     ///
     /// - Parameters:
-    ///   - timeline: A ``StreamingTimeline`` to receive events for.
+    ///   - timelines: The ``StreamingTimeline``'s to receive events for.
     ///   - bufferingPolicy: A `Continuation.BufferingPolicy` value to set the stream’s buffering behavior. By default, the stream buffers an unlimited number of elements. You can also set the policy to buffer a specified number of oldest or newest elements.
     ///
     /// - Returns: An `AsyncThrowingStream` of ``Event`` values for connection status changes and events received from the server. This stream throws an error if the connection irrecoverably ends.
     ///
     /// - Throws: ``TootSDKError/clientDeinited`` if there is no ``TootClient`` instance available to start a connection on.
-    public func subscribe(to timeline: StreamingTimeline, bufferingPolicy: Stream.Continuation.BufferingPolicy = .unbounded) async throws -> Stream {
+    public func subscribe(to timelines: Set<StreamingTimeline>, bufferingPolicy: Stream.Continuation.BufferingPolicy = .unbounded) async throws -> Stream {
         // Check if we are already subscribed to this timeline
-        let isAlreadySubscribed: Bool
+        let requiredSubscriptions : Set<StreamingTimeline>
         if connection != nil {
-            isAlreadySubscribed = subscribers.contains(where: { $0.timeline == timeline })
+            requiredSubscriptions = timelines.subtracting(subscribers.map(\.timeline))
         } else {
-            isAlreadySubscribed = false
+            requiredSubscriptions = timelines
         }
 
         // Create an AsyncStream that we can store the continuation and yield values to as we receive them.
         let stream = Stream(bufferingPolicy: bufferingPolicy) { continuation in
-            let subscriber = Subscriber(timeline: timeline, continuation: continuation)
-            self.subscribers.insert(subscriber)
+            let subscribers = timelines.map {
+                // TBD(hh): This is likely wrong because the continuation may
+                //          be finished by any of the subscribers?
+                Subscriber(timeline: $0, continuation: continuation)
+            }
+            self.subscribers.formUnion(subscribers)
             continuation.onTermination = { _ in
                 // When the stream is terminated, remove this subscriber.
                 Task {
-                    try? await self.unsubscribe(subscriber)
+                    for subscriber in subscribers {
+                        try? await self.unsubscribe(subscriber)
+                    }
                 }
             }
         }
 
         // If there is an existing connection and we are not already subscribed, send subscribe request. Otherwise, attempt to start a connection if necessary.
         if let connection {
-            if !isAlreadySubscribed {
+            for timeline in requiredSubscriptions {
                 #if canImport(OSLog)
                     Self.logger.debug("Sending subscribe query for new subscriber to timeline \(timeline.rawValue).")
                 #endif
@@ -146,6 +152,20 @@ public actor StreamingClient {
         }
 
         return stream
+    }
+    /// Subscribe to a stream of events from a ``StreamingTimeline``.
+    ///
+    /// Begins a WebSocket connection if there is not already one; otherwise, subscribes to the timeline using the existing connection. If the connection is currently down between retry attempts, will wait until the next successful connection to send the subscribe request, unless ``disconnect()`` is called before then.
+    ///
+    /// - Parameters:
+    ///   - timeline: A ``StreamingTimeline`` to receive events for.
+    ///   - bufferingPolicy: A `Continuation.BufferingPolicy` value to set the stream’s buffering behavior. By default, the stream buffers an unlimited number of elements. You can also set the policy to buffer a specified number of oldest or newest elements.
+    ///
+    /// - Returns: An `AsyncThrowingStream` of ``Event`` values for connection status changes and events received from the server. This stream throws an error if the connection irrecoverably ends.
+    ///
+    /// - Throws: ``TootSDKError/clientDeinited`` if there is no ``TootClient`` instance available to start a connection on.
+    public func subscribe(to timeline: StreamingTimeline, bufferingPolicy: Stream.Continuation.BufferingPolicy = .unbounded) async throws -> Stream {
+        try await subscribe(to: [ timeline ], bufferingPolicy: bufferingPolicy)
     }
 
     /// Remove a subscriber. If there are no remaining subscribers to its ``StreamingTimeline`` and there is an active connection, unsubscribe from that timeline.
